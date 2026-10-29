@@ -1,0 +1,788 @@
+package com.link.easyai.starter.engine.intent;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.link.easyai.starter.config.LLMlHolder;
+import com.link.easyai.starter.engine.AiTaskProperties;
+import com.link.easyai.starter.engine.AiTaskConfigService;
+import com.link.easyai.starter.engine.config.AiTaskConfig;
+import com.link.easyai.starter.engine.config.FieldDefinition;
+import com.link.easyai.starter.engine.llm.LlmCallException;
+import com.link.easyai.starter.engine.llm.LlmClient;
+import com.link.easyai.starter.engine.llm.RobustJsonParser;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 默认意图识别引擎实现。
+ * <p>
+ * <b>LLM 优先，关键词降级：</b>
+ * <ol>
+ *   <li>先调用 LLM 进行意图分类（few-shot prompt，传入所有任务的 name/description/examples）</li>
+ *   <li>LLM 返回 taskType + confidence + reason + action</li>
+ *   <li>高置信度直接返回；低置信度返回候选列表供澄清</li>
+ *   <li>LLM 调用失败/超时时，降级到关键词快速匹配</li>
+ * </ol>
+ * <p>
+ * <b>带上下文识别：</b>有活跃任务时，LLM 同时判断 continue/switch/cancel。
+ */
+@Component
+public class DefaultIntentEngine implements IntentEngine {
+
+    private static final Logger log = LoggerFactory.getLogger(DefaultIntentEngine.class);
+
+    /**
+     * 多任务路由中，非活跃候选任务只用于判断是否应开启新任务。保留足够的
+     * 业务语义以区分相近场景，同时限制每项长度，避免候选列表挤占当前任务上下文。
+     */
+    private static final int MAX_SWITCH_TASK_DESCRIPTION_LENGTH = 240;
+    private static final int MAX_SWITCH_TASK_EXAMPLES = 3;
+    private static final int MAX_SWITCH_TASK_EXAMPLE_LENGTH = 80;
+
+    private final AiTaskConfigService configService;
+    private final LlmClient llmClient;
+    private final LLMlHolder llmHolder;
+    private final AiTaskProperties properties;
+
+    @Autowired
+    public DefaultIntentEngine(AiTaskConfigService configService,
+                                LlmClient llmClient,
+                                LLMlHolder llmHolder,
+                                AiTaskProperties properties) {
+        this.configService = configService;
+        this.llmClient = llmClient;
+        this.llmHolder = llmHolder;
+        this.properties = properties;
+    }
+
+    /**
+     * 解析意图识别使用的模型：
+     * 优先 easy-ai.task-engine.llm.intent-provider（可选配置），
+     * 缺省回退到全局 llm.provider（LLMlHolder 的活动模型）。
+     */
+    private String resolveIntentModel() {
+        if (properties != null && properties.getLlm() != null
+                && properties.getLlm().getIntentProvider() != null
+                && !properties.getLlm().getIntentProvider().isBlank()) {
+            return properties.getLlm().getIntentProvider();
+        }
+        return llmHolder != null ? llmHolder.getActiveModelName() : "deepseek";
+    }
+
+    @Override
+    public IntentResult recognize(String userMessage) {
+        return recognize(userMessage, null);
+    }
+
+    @Override
+    public IntentResult recognize(String userMessage, String tenantId) {
+        if (userMessage == null || userMessage.isBlank()) {
+            return IntentResult.fallback("Empty message");
+        }
+
+        Map<String, AiTaskConfig> allConfigs = configService.getPublishedConfigs(tenantId);
+        if (allConfigs.isEmpty()) {
+            log.warn("[IntentEngine] no task configs available, returning fallback");
+            return IntentResult.fallback("No task configs available");
+        }
+
+        // LLM 优先
+        try {
+            IntentResult result = classifyByLlm(userMessage, allConfigs);
+            if (result != null) {
+                log.info("[IntentEngine] LLM recognized: taskType={}, confidence={}, source={}",
+                        result.getTaskType(), result.getConfidence(), result.getSource());
+                return result;
+            }
+        } catch (Exception e) {
+            log.warn("[IntentEngine] LLM classification failed, falling back to keyword: {}", e.getMessage());
+        }
+
+        // 降级：关键词匹配
+        IntentResult keywordResult = matchByKeyword(userMessage, allConfigs);
+        if (keywordResult != null) {
+            log.info("[IntentEngine] keyword fallback match: taskType={}", keywordResult.getTaskType());
+            return keywordResult;
+        }
+
+        List<String> taskNames = allConfigs.values().stream().map(config -> config.getName()).toList();
+        // 无匹配
+        return IntentResult.builder()
+                .taskType(null)
+                .confidence(0.0)
+                .reason("No intent matched by LLM or keyword")
+                .candidates(taskNames)
+                .source(MatchSource.FALLBACK)
+                .build();
+    }
+
+    @Override
+    public IntentResult recognizeWithContext(String userMessage,
+                                               String currentTaskType,
+                                               String currentTaskName,
+                                               String currentTaskDescription,
+                                               String collectedFields,
+                                               String lastAiReply,
+                                               String recentHistory) {
+        return recognizeWithContext(userMessage, currentTaskType, currentTaskName, currentTaskDescription,
+                collectedFields, lastAiReply, recentHistory, null);
+    }
+
+    @Override
+    public IntentResult recognizeWithContext(String userMessage, String currentTaskType,
+                                               String currentTaskName, String currentTaskDescription,
+                                               String collectedFields, String lastAiReply,
+                                               String recentHistory, String tenantId) {
+        if (userMessage == null || userMessage.isBlank()) {
+            return IntentResult.continueTask(currentTaskType);
+        }
+
+        Map<String, AiTaskConfig> allConfigs = configService.getPublishedConfigs(tenantId);
+        if (allConfigs.isEmpty()) {
+            return IntentResult.continueTask(currentTaskType);
+        }
+
+        AiTaskConfig current = allConfigs.get(currentTaskType);
+        if (current != null) {
+            currentTaskName = current.getName();
+            currentTaskDescription = current.getDescription();
+        }
+
+        // LLM 判断 continue/switch/cancel
+        try {
+            IntentResult result = classifyWithContextByLlm(
+                    userMessage, currentTaskType, currentTaskName, currentTaskDescription,
+                    collectedFields, lastAiReply, recentHistory, allConfigs);
+            if (result != null) {
+                log.info("[IntentEngine] LLM context result: action={}, taskType={}, confidence={}",
+                        result.getAction(), result.getTaskType(), result.getConfidence());
+                return result;
+            }
+        } catch (Exception e) {
+            log.warn("[IntentEngine] LLM context classification failed, defaulting to continue: {}", e.getMessage());
+        }
+
+        // LLM 失败时默认继续当前任务（保守策略，不轻易切换）
+        return IntentResult.continueTask(currentTaskType);
+    }
+
+    @Override
+    public IntentResult recognizeWithTasks(String userMessage,
+                                           List<TaskSummary> activeTasks,
+                                           Map<String, AiTaskConfig> configs) {
+        if (userMessage == null || userMessage.isBlank()) {
+            return defaultContinue(activeTasks);
+        }
+        if (activeTasks == null || activeTasks.isEmpty()) {
+            return IntentResult.fallback("No active tasks");
+        }
+        if (configs == null || configs.isEmpty()) {
+            return defaultContinue(activeTasks);
+        }
+
+        try {
+            IntentResult result = classifyWithTasksByLlm(userMessage, activeTasks, configs);
+            if (result != null) {
+                if (result.isContinueExisting() || result.isCancelExisting()) {
+                    // 校验 targetTaskId 确实属于进行中任务（防 LLM 幻觉）
+                    if (!containsTaskId(activeTasks, result.getTargetTaskId())) {
+                        log.warn("[IntentEngine] LLM returned invalid targetTaskId={}, defaulting to most recent task",
+                                result.getTargetTaskId());
+                        return defaultContinue(activeTasks);
+                    }
+                    return result;
+                }
+                if (result.isSwitchNew()) {
+                    // 校验新任务类型存在；无效则保守降级为继续最近任务
+                    if (result.getTaskType() != null && configs.containsKey(result.getTaskType())) {
+                        return result;
+                    }
+                    log.warn("[IntentEngine] LLM switch_new with invalid intent={}, defaulting to most recent task",
+                            result.getTaskType());
+                    return defaultContinue(activeTasks);
+                }
+                log.warn("[IntentEngine] LLM returned unrecognized action={}, defaulting to most recent task",
+                        result.getAction());
+                return defaultContinue(activeTasks);
+            }
+        } catch (Exception e) {
+            log.warn("[IntentEngine] LLM multi-task routing failed, defaulting to most recent task: {}",
+                    e.getMessage());
+        }
+        return defaultContinue(activeTasks);
+    }
+
+    /**
+     * 多任务路由的保守默认：拿不准时归属最近活跃的任务（activeTasks 列表第一个）。
+     */
+    private IntentResult defaultContinue(List<TaskSummary> activeTasks) {
+        TaskSummary recent = activeTasks.get(0);
+        return IntentResult.builder()
+                .action(IntentResult.ACTION_CONTINUE_EXISTING)
+                .targetTaskId(recent.getTaskId())
+                .taskType(recent.getTaskType())
+                .confidence(1.0)
+                .reason("Defaulting to most recent active task (LLM unavailable or ambiguous)")
+                .source(MatchSource.CONTINUE)
+                .build();
+    }
+
+    private boolean containsTaskId(List<TaskSummary> tasks, String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return false;
+        }
+        for (TaskSummary task : tasks) {
+            if (taskId.equals(task.getTaskId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- LLM 分类（多任务路由，判断 continue_existing/switch_new/cancel_existing） ----
+
+    private IntentResult classifyWithTasksByLlm(String userMessage,
+                                                 List<TaskSummary> activeTasks,
+                                                 Map<String, AiTaskConfig> configs) {
+        String prompt = buildMultiTaskPrompt(userMessage, activeTasks, configs);
+        String primaryModel = resolveIntentModel();
+
+        String response;
+        try {
+            response = llmClient.chatCompletion(primaryModel, prompt, userMessage);
+        } catch (LlmCallException e) {
+            log.warn("[IntentEngine] LLM call failed for multi-task routing: {}", e.getMessage());
+            return null;
+        }
+
+        if (response == null || response.isBlank()) {
+            return null;
+        }
+
+        try {
+            JsonNode root = RobustJsonParser.parse(response);
+            String action = root.has("action") && !root.get("action").isNull()
+                    ? root.get("action").asText().toLowerCase() : null;
+            String targetTaskId = root.has("targetTaskId") && !root.get("targetTaskId").isNull()
+                    ? root.get("targetTaskId").asText() : null;
+            String newIntent = root.has("intent") && !root.get("intent").isNull()
+                    ? root.get("intent").asText() : null;
+            double confidence = root.has("confidence") && root.get("confidence").isNumber()
+                    ? root.get("confidence").asDouble() : 0.0;
+            String reason = root.has("reason") && !root.get("reason").isNull()
+                    ? root.get("reason").asText() : null;
+
+            IntentResult.IntentResultBuilder builder = IntentResult.builder()
+                    .action(action)
+                    .confidence(confidence)
+                    .reason(reason)
+                    .source(MatchSource.LLM);
+
+            if (IntentResult.ACTION_CONTINUE_EXISTING.equals(action) && targetTaskId != null) {
+                builder.targetTaskId(targetTaskId);
+            } else if (IntentResult.ACTION_CANCEL_EXISTING.equals(action) && targetTaskId != null) {
+                builder.targetTaskId(targetTaskId);
+            } else if (IntentResult.ACTION_SWITCH_NEW.equals(action) && newIntent != null) {
+                builder.taskType(newIntent);
+            }
+
+            log.info("[IntentEngine] LLM multi-task result: action={}, targetTaskId={}, intent={}, confidence={}, reason={}",
+                    action, targetTaskId, newIntent, confidence, reason);
+            return builder.build();
+
+        } catch (Exception e) {
+            log.warn("[IntentEngine] failed to parse LLM multi-task response: {} | raw={}",
+                    e.getMessage(), response);
+            return null;
+        }
+    }
+
+    @Override
+    public List<String> listAllTaskTypes() {
+        return new ArrayList<>(configService.getAnnotationConfigs().keySet());
+    }
+
+    @Override
+    public boolean judgeContinuity(String userMessage,
+                                     String lastTaskType,
+                                     String lastTaskName,
+                                     String lastCollectedFields,
+                                     String lastAiReply) {
+        if (userMessage == null || userMessage.isBlank() || lastTaskType == null) {
+            return false;
+        }
+
+        try {
+            String prompt = buildContinuityPrompt(userMessage, lastTaskType, lastTaskName,
+                    lastCollectedFields, lastAiReply);
+            String primaryModel = resolveIntentModel();
+            String response = llmClient.chatCompletion(primaryModel, prompt, userMessage);
+
+            if (response == null || response.isBlank()) {
+                return false;
+            }
+
+            JsonNode root = RobustJsonParser.parse(response);
+            boolean continuous = root.has("continuous") && root.get("continuous").asBoolean(false);
+            String reason = root.has("reason") && !root.get("reason").isNull()
+                    ? root.get("reason").asText() : null;
+            log.info("[IntentEngine] continuity judgment: continuous={}, reason={}", continuous, reason);
+            return continuous;
+        } catch (Exception e) {
+            log.warn("[IntentEngine] continuity judgment failed, defaulting to false (new task): {}", e.getMessage());
+            return false;
+        }
+    }
+
+    // ---- LLM 分类（全新对话） ----
+
+    private IntentResult classifyByLlm(String userMessage, Map<String, AiTaskConfig> configs) {
+        String prompt = buildClassificationPrompt(userMessage, configs);
+        String primaryModel = resolveIntentModel();
+
+        String response;
+        try {
+            response = llmClient.chatCompletion(primaryModel, prompt, userMessage);
+        } catch (LlmCallException e) {
+            log.warn("[IntentEngine] LLM call failed for intent classification: {}", e.getMessage());
+            return null;
+        }
+
+        if (response == null || response.isBlank()) {
+            return null;
+        }
+
+        try {
+            JsonNode root = RobustJsonParser.parse(response);
+            String intent = root.has("intent") && !root.get("intent").isNull()
+                    ? root.get("intent").asText() : null;
+            double confidence = root.has("confidence") && root.get("confidence").isNumber()
+                    ? root.get("confidence").asDouble() : 0.0;
+            String reason = root.has("reason") && !root.get("reason").isNull()
+                    ? root.get("reason").asText() : null;
+
+            if (intent != null && !intent.isBlank() && !"null".equalsIgnoreCase(intent)
+                    && configs.containsKey(intent)) {
+                return IntentResult.builder()
+                        .taskType(intent)
+                        .confidence(confidence)
+                        .reason(reason)
+                        .source(MatchSource.LLM)
+                        .build();
+            }
+
+            return IntentResult.builder()
+                    .taskType(null)
+                    .confidence(confidence)
+                    .reason(reason != null ? reason : "LLM returned no valid intent")
+                    .candidates(new ArrayList<>(configs.keySet()))
+                    .source(MatchSource.LLM)
+                    .build();
+
+        } catch (Exception e) {
+            log.warn("[IntentEngine] failed to parse LLM intent response: {} | raw={}",
+                    e.getMessage(), response);
+            return null;
+        }
+    }
+
+    // ---- LLM 分类（带上下文，判断 continue/switch/cancel） ----
+
+    private IntentResult classifyWithContextByLlm(String userMessage,
+                                                    String currentTaskType,
+                                                    String currentTaskName,
+                                                    String currentTaskDescription,
+                                                    String collectedFields,
+                                                    String lastAiReply,
+                                                    String recentHistory,
+                                                    Map<String, AiTaskConfig> configs) {
+        String prompt = buildContextPrompt(userMessage, currentTaskType, currentTaskName,
+                currentTaskDescription, collectedFields, lastAiReply, recentHistory, configs);
+        String primaryModel = resolveIntentModel();
+
+        String response;
+        try {
+            response = llmClient.chatCompletion(primaryModel, prompt, userMessage);
+        } catch (LlmCallException e) {
+            log.warn("[IntentEngine] LLM call failed for context classification: {}", e.getMessage());
+            return null;
+        }
+
+        if (response == null || response.isBlank()) {
+            return null;
+        }
+
+        try {
+            JsonNode root = RobustJsonParser.parse(response);
+            String action = root.has("action") && !root.get("action").isNull()
+                    ? root.get("action").asText().toLowerCase() : IntentResult.ACTION_CONTINUE;
+            String newIntent = root.has("intent") && !root.get("intent").isNull()
+                    ? root.get("intent").asText() : null;
+            double confidence = root.has("confidence") && root.get("confidence").isNumber()
+                    ? root.get("confidence").asDouble() : 0.0;
+            String reason = root.has("reason") && !root.get("reason").isNull()
+                    ? root.get("reason").asText() : null;
+
+            IntentResult.IntentResultBuilder builder = IntentResult.builder()
+                    .action(action)
+                    .confidence(confidence)
+                    .reason(reason)
+                    .source(MatchSource.LLM);
+
+            if (IntentResult.ACTION_SWITCH.equals(action) && newIntent != null
+                    && configs.containsKey(newIntent)) {
+                builder.taskType(newIntent);
+            } else if (IntentResult.ACTION_CONTINUE.equals(action)) {
+                builder.taskType(currentTaskType);
+            }
+
+            return builder.build();
+
+        } catch (Exception e) {
+            log.warn("[IntentEngine] failed to parse LLM context response: {} | raw={}",
+                    e.getMessage(), response);
+            return null;
+        }
+    }
+
+    // ---- 关键词降级匹配 ----
+
+    /** 常见虚词/语气词，归一化匹配时移除，提升自然语言变体的命中率 */
+    private static final java.util.Set<String> STOP_WORDS = java.util.Set.of(
+            "你", "我", "他", "她", "它", "的", "了", "吗", "呢", "啊", "吧", "呀", "哦",
+            "为", "给", "把", "被", "让", "使", "向", "往", "从", "到", "在", "于",
+            "一下", "一个", "一些", "这", "那", "这个", "那个", "什么", "怎么", "如何",
+            "请", "请问", "帮忙", "帮我", "能否", "可不可以", "能不能"
+    );
+
+    private IntentResult matchByKeyword(String userMessage, Map<String, AiTaskConfig> configs) {
+        String lowerMessage = userMessage.toLowerCase();
+        String normalizedMessage = normalize(lowerMessage);
+
+        for (Map.Entry<String, AiTaskConfig> entry : configs.entrySet()) {
+            AiTaskConfig config = entry.getValue();
+            List<String> keywords = config.getKeywords();
+            if (keywords == null || keywords.isEmpty()) {
+                continue;
+            }
+            for (String keyword : keywords) {
+                if (keyword == null || keyword.isBlank()) {
+                    continue;
+                }
+                String lowerKeyword = keyword.toLowerCase();
+                // 1. 精确包含匹配
+                if (lowerMessage.contains(lowerKeyword)) {
+                    return IntentResult.keywordMatch(entry.getKey(), "Matched keyword: " + keyword);
+                }
+                // 2. 归一化匹配（移除虚词后再匹配，处理"你能为我做什么" vs "你能做什么"）
+                String normalizedKeyword = normalize(lowerKeyword);
+                if (!normalizedKeyword.isBlank() && normalizedKeyword.length() >= 2
+                        && normalizedMessage.contains(normalizedKeyword)) {
+                    log.debug("[IntentEngine] normalized keyword match: '{}' ~= '{}'", keyword, lowerMessage);
+                    return IntentResult.keywordMatch(entry.getKey(),
+                            "Matched keyword (normalized): " + keyword);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 归一化文本：移除常见虚词、标点、多余空格，用于模糊关键词匹配。
+     */
+    private String normalize(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String result = text;
+        // 移除标点
+        result = result.replaceAll("[\\p{Punct}\\p{S}]", "");
+        // 移除虚词（按长度降序替换，避免"一下"被"一"先替换）
+        for (String word : STOP_WORDS) {
+            result = result.replace(word, "");
+        }
+        // 移除多余空格
+        result = result.replaceAll("\\s+", "");
+        return result;
+    }
+
+    // ---- Prompt 构建 ----
+
+    private String buildClassificationPrompt(String userMessage, Map<String, AiTaskConfig> configs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个客服意图分类器。请根据用户消息判断用户意图。\n\n");
+        sb.append("可用意图列表：\n");
+
+        for (Map.Entry<String, AiTaskConfig> entry : configs.entrySet()) {
+            AiTaskConfig config = entry.getValue();
+            sb.append("- ").append(config.getTaskType()).append(": ").append(config.getName()).append("\n");
+            if (config.getDescription() != null && !config.getDescription().isBlank()) {
+                sb.append("  描述: ").append(config.getDescription()).append("\n");
+            }
+            if (config.getExamples() != null && !config.getExamples().isEmpty()) {
+                sb.append("  用户表达方式示例: ").append(String.join("; ", config.getExamples())).append("\n");
+            }
+        }
+
+        sb.append("\n请以 JSON 格式返回:\n");
+        sb.append("{\n");
+        sb.append("  \"intent\": \"最匹配的意图 type，无匹配则为 null\",\n");
+        sb.append("  \"confidence\": 0.0-1.0,\n");
+        sb.append("  \"reason\": \"简短判断理由\"\n");
+        sb.append("}\n");
+
+        return sb.toString();
+    }
+
+    private String buildContextPrompt(String userMessage,
+                                        String currentTaskType,
+                                        String currentTaskName,
+                                        String currentTaskDescription,
+                                        String collectedFields,
+                                        String lastAiReply,
+                                        String recentHistory,
+                                        Map<String, AiTaskConfig> configs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个客服对话意图判断器。用户正在进行一个任务，请判断用户的下一条消息属于哪种情况：\n\n");
+        sb.append("【判断规则 - 非常重要】\n");
+        sb.append("1. continue - 继续当前任务：用户在补充参数、修正信息、回答AI的提问、或描述与当前任务相关的内容。\n");
+        sb.append("   注意：即使消息中提到了其他业务名词（如\"物流\"、\"退款\"），只要是在描述当前任务的问题内容，就应该 continue。\n");
+        sb.append("2. switch - 切换到新任务：用户明确表示要做另一件完全不同的事情，如\"我要退款\"、\"帮我查物流\"、\"我要请假\"。\n");
+        sb.append("   注意：必须是用户主动发起的新操作请求，而不是在描述当前任务的内容。\n");
+        sb.append("3. cancel - 取消当前任务：用户说\"算了\"、\"不弄了\"、\"取消\"、\"不用了\"等。\n\n");
+
+        sb.append("【默认策略】\n");
+        sb.append("拿不准时一律返回 continue！错误地切换任务比错误地继续任务的后果严重得多。\n\n");
+
+        sb.append("【当前任务完整信息】\n");
+        sb.append("  任务类型: ").append(currentTaskType).append("\n");
+        sb.append("  任务名称: ").append(currentTaskName != null ? currentTaskName : currentTaskType).append("\n");
+        if (currentTaskDescription != null && !currentTaskDescription.isBlank()) {
+            sb.append("  任务描述: ").append(currentTaskDescription).append("\n");
+        }
+        if (collectedFields != null && !collectedFields.isBlank()) {
+            sb.append("  已收集字段: ").append(collectedFields).append("\n");
+        }
+
+        // 获取当前任务配置，列出待收集字段
+        AiTaskConfig currentConfig = configs.get(currentTaskType);
+        if (currentConfig != null && currentConfig.getExamples() != null && !currentConfig.getExamples().isEmpty()) {
+            sb.append("  用户表达方式示例: ").append(String.join("；", currentConfig.getExamples())).append("\n");
+        }
+        if (currentConfig != null && currentConfig.getFields() != null && !currentConfig.getFields().isEmpty()) {
+            sb.append("  待收集字段: ");
+            List<String> pendingFields = new ArrayList<>();
+            for (FieldDefinition fc : currentConfig.getFields()) {
+                if (fc != null && fc.getCode() != null) {
+                    boolean collected = collectedFields != null
+                            && collectedFields.contains(fc.getCode() + "=");
+                    if (!collected) {
+                        String label = fc.getName() != null ? fc.getName() : fc.getCode();
+                        pendingFields.add(label + "(" + fc.getCode() + ")");
+                    }
+                }
+            }
+            sb.append(pendingFields.isEmpty() ? "无（所有字段已收集）" : String.join("、", pendingFields));
+            sb.append("\n");
+        }
+
+        if (lastAiReply != null && !lastAiReply.isBlank()) {
+            sb.append("\n【上一轮 AI 回复】\n").append(lastAiReply).append("\n");
+        }
+
+        if (recentHistory != null && !recentHistory.isBlank()) {
+            sb.append("\n【最近对话历史】\n").append(recentHistory).append("\n");
+        }
+
+        appendSwitchCandidateTasks(sb, configs, currentTaskType);
+
+        sb.append("\n【示例】\n");
+        sb.append("当前任务=创建工单，待收集=电话、类型、姓名\n");
+        sb.append("- 用户说\"13800138000，我要投诉物流太慢\" → continue（在提供电话和问题描述）\n");
+        sb.append("- 用户说\"我要查一下物流\" → switch（明确要做新操作）\n");
+        sb.append("- 用户说\"算了不弄了\" → cancel\n\n");
+
+        sb.append("用户消息: ").append(userMessage).append("\n\n");
+
+        sb.append("请以 JSON 格式返回:\n");
+        sb.append("{\n");
+        sb.append("  \"action\": \"continue | switch | cancel\",\n");
+        sb.append("  \"intent\": \"如果是 switch，填写新任务的 type；否则为 null\",\n");
+        sb.append("  \"confidence\": 0.0-1.0（switch 时请给出高置信度，低于0.8请改为continue）,\n");
+        sb.append("  \"reason\": \"简短判断理由，说明为什么是continue/switch/cancel\"\n");
+        sb.append("}\n");
+
+        return sb.toString();
+    }
+
+    private String buildMultiTaskPrompt(String userMessage,
+                                         List<TaskSummary> activeTasks,
+                                         Map<String, AiTaskConfig> configs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个客服对话路由判断器。用户正在进行一个或多个任务，请判断用户的下一条消息属于哪种情况：\n\n");
+        sb.append("【判断规则 - 非常重要】\n");
+        sb.append("1. continue_existing - 归属某个进行中任务：用户在补充该任务的参数、修正信息、回答AI的提问、或描述与该任务相关的内容。\n");
+        sb.append("2. switch_new - 开启全新任务：用户主动发起一项独立的新业务操作。新任务可以与进行中任务属于同一 type；类型相同不代表必须归属旧任务。此时 targetTaskId 为 null，intent 填写新任务的 type。\n");
+        sb.append("3. cancel_existing - 取消某个进行中任务：用户说\"算了\"、\"不弄了\"、\"取消\"、\"不用了\"等，明确针对某个任务。此时 targetTaskId 填写要取消的任务 id。\n\n");
+
+        sb.append("【任务归属判定优先级 - 必须遵守】\n");
+        sb.append("1. 先检查进行中任务的“业务实体标识”。这是任务配置显式标记的订单号、运单号、工单号、账号等，不是用户要修改的新值或普通参数。\n");
+        sb.append("   - 用户消息中的标识与某任务匹配：continue_existing 到该任务。\n");
+        sb.append("   - 用户消息含有与所有进行中任务标识不同的新业务实体，且消息本身表达了明确操作：switch_new，即使操作类型与现有任务相同。\n");
+        sb.append("2. 没有显式业务实体标识时，结合“已收集字段”、字段名称、最近用户消息和上一轮 AI 回复判断语义：\n");
+        sb.append("   - 回答追问、确认、补充/修正待收集参数，或只含参数片段：continue_existing。\n");
+        sb.append("   - 消息自身已构成独立、完整的新业务请求：switch_new；不得仅因存在同类型任务而合并。\n");
+        sb.append("3. 只有在消息缺少可区分业务实体且无法判断是否独立时，才使用默认策略。\n\n");
+
+        sb.append("【默认策略】\n");
+        sb.append("拿不准时一律返回 continue_existing，targetTaskId 填【最近活跃的任务】（列表中的第 1 个）。但消息已经包含不同业务实体或明确独立请求时，不属于“拿不准”，必须 switch_new。\n\n");
+
+        sb.append("【进行中任务列表】（最近活跃在前）\n");
+        for (int i = 0; i < activeTasks.size(); i++) {
+            TaskSummary task = activeTasks.get(i);
+            sb.append(i + 1).append(". taskId=").append(task.getTaskId())
+              .append(", type=").append(task.getTaskType())
+              .append(", 名称=").append(task.getTaskName() != null ? task.getTaskName() : task.getTaskType());
+            if (task.getTaskDescription() != null && !task.getTaskDescription().isBlank()) {
+                sb.append(", 描述=").append(task.getTaskDescription());
+            }
+            sb.append(", 待收集字段=").append(task.getPendingFieldsSummary() != null
+                    ? task.getPendingFieldsSummary() : "无");
+            sb.append(", 业务实体标识=").append(task.getEntityReferencesSummary() != null
+                    ? task.getEntityReferencesSummary() : "无");
+            sb.append(", 已收集字段=").append(task.getCollectedFieldsSummary() != null
+                    ? task.getCollectedFieldsSummary() : "无");
+            if (task.getLastUserMessage() != null && !task.getLastUserMessage().isBlank()) {
+                sb.append(", 最近用户消息=").append(task.getLastUserMessage());
+            }
+            if (task.getLastAiReply() != null && !task.getLastAiReply().isBlank()) {
+                sb.append(", 上一轮AI回复=").append(task.getLastAiReply());
+            }
+            sb.append("\n");
+        }
+
+        appendSwitchCandidateTasks(sb, configs, null);
+
+        sb.append("\n【示例】\n");
+        sb.append("进行中任务：1. taskId=A, type=CREATE_TICKET(创建工单，待收集=电话)；2. taskId=B, type=LOGISTICS_QUERY(物流查询)\n");
+        sb.append("- 用户说\"13800138000，link\" → continue_existing，targetTaskId=A（在补充工单的电话和姓名）\n");
+        sb.append("- 用户说\"单号JT123 到哪了\" → continue_existing，targetTaskId=B（在查物流轨迹）\n");
+        sb.append("- 用户说\"帮我退款\" → switch_new，targetTaskId=null，intent=REFUND_REQUEST（明确开启新任务）\n");
+        sb.append("- 进行中 ORDER_UPDATE 的业务实体标识=客户单号 TESTTFX2609221；用户说\"TESTTFX2609164改D011\" → switch_new，intent=ORDER_UPDATE（不同订单号且包含完整修改请求）\n");
+        sb.append("- 进行中任务没有业务实体标识；用户说\"确认\"或\"改成蓝色\" → continue_existing（回答或参数片段）\n");
+        sb.append("- 进行中任务没有业务实体标识；用户说\"另外帮我创建一个退货申请\" → switch_new（独立的新业务请求）\n");
+        sb.append("- 用户说\"算了不弄了\" → cancel_existing，targetTaskId=A（取消最近的工单任务）\n\n");
+
+        sb.append("用户消息: ").append(userMessage).append("\n\n");
+
+        sb.append("请以 JSON 格式返回:\n");
+        sb.append("{\n");
+        sb.append("  \"action\": \"continue_existing | switch_new | cancel_existing\",\n");
+        sb.append("  \"targetTaskId\": \"continue_existing/cancel_existing 时填目标任务 id，switch_new 时为 null\",\n");
+        sb.append("  \"intent\": \"switch_new 时填新任务的 type，否则为 null\",\n");
+        sb.append("  \"confidence\": 0.0-1.0（switch_new 时请给出高置信度，低于0.8请改为continue_existing）,\n");
+        sb.append("  \"reason\": \"简短判断理由，说明为什么是 continue_existing/switch_new/cancel_existing\"\n");
+        sb.append("}\n");
+
+        return sb.toString();
+    }
+
+    /**
+     * 输出“切换新任务”候选的紧凑语义信息。
+     * <p>
+     * 不携带字段定义、已收集值或对话历史：这些信息只与活跃任务的归属判断有关；
+     * 描述和少量示例则是区分名称相近但业务不同场景所必需的线索。
+     */
+    private void appendSwitchCandidateTasks(StringBuilder sb,
+                                            Map<String, AiTaskConfig> configs,
+                                            String excludedTaskType) {
+        sb.append("\n【其他可用任务】（仅在用户明确要开启新任务时参考）:\n");
+        for (Map.Entry<String, AiTaskConfig> entry : configs.entrySet()) {
+            if ((excludedTaskType != null && excludedTaskType.equals(entry.getKey()))
+                    || entry.getValue() == null) {
+                continue;
+            }
+
+            AiTaskConfig config = entry.getValue();
+            String taskType = config.getTaskType() != null && !config.getTaskType().isBlank()
+                    ? config.getTaskType() : entry.getKey();
+            String taskName = config.getName() != null && !config.getName().isBlank()
+                    ? config.getName() : taskType;
+            sb.append("- ").append(taskType).append(": ").append(taskName).append("\n");
+
+            String description = abbreviateForPrompt(config.getDescription(), MAX_SWITCH_TASK_DESCRIPTION_LENGTH);
+            if (description != null) {
+                sb.append("  描述: ").append(description).append("\n");
+            }
+
+            List<String> examples = new ArrayList<>();
+            if (config.getExamples() != null) {
+                for (String example : config.getExamples()) {
+                    String abbreviated = abbreviateForPrompt(example, MAX_SWITCH_TASK_EXAMPLE_LENGTH);
+                    if (abbreviated != null) {
+                        examples.add(abbreviated);
+                    }
+                    if (examples.size() == MAX_SWITCH_TASK_EXAMPLES) {
+                        break;
+                    }
+                }
+            }
+            if (!examples.isEmpty()) {
+                sb.append("  用户表达方式示例: ").append(String.join("；", examples)).append("\n");
+            }
+        }
+    }
+
+    private String abbreviateForPrompt(String value, int maxLength) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        String normalized = value.trim();
+        if (normalized.length() <= maxLength) {
+            return normalized;
+        }
+        return normalized.substring(0, maxLength) + "…";
+    }
+
+    // ---- 连续性判断 Prompt ----
+
+    private String buildContinuityPrompt(String userMessage,
+                                           String lastTaskType,
+                                           String lastTaskName,
+                                           String lastCollectedFields,
+                                           String lastAiReply) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("你是一个对话连续性判断器。用户之前正在进行一个任务，但会话连接中断了。\n");
+        sb.append("现在用户发来了一条新消息，请判断这条消息是在【继续上一轮任务】，还是在【开启一个全新的话题】。\n\n");
+
+        sb.append("上一轮任务上下文:\n");
+        sb.append("  任务类型: ").append(lastTaskType).append("\n");
+        sb.append("  任务名称: ").append(lastTaskName != null ? lastTaskName : lastTaskType).append("\n");
+        if (lastCollectedFields != null && !lastCollectedFields.isBlank()) {
+            sb.append("  已收集字段: ").append(lastCollectedFields).append("\n");
+        }
+        if (lastAiReply != null && !lastAiReply.isBlank()) {
+            sb.append("  上一轮AI回复: ").append(lastAiReply).append("\n");
+        }
+
+        sb.append("\n当前用户消息: ").append(userMessage).append("\n\n");
+
+        sb.append("判断规则:\n");
+        sb.append("- 如果用户在补充上一轮任务所需的参数、修正已收集的信息、或回应上一轮AI的提问 → continuous=true\n");
+        sb.append("- 如果用户在询问完全不同的事情、想做另一个操作、或明确表示要重新开始 → continuous=false\n");
+        sb.append("- 拿不准时，倾向于 continuous=false（开启新任务更安全）\n\n");
+
+        sb.append("请以 JSON 格式返回:\n");
+        sb.append("{\n");
+        sb.append("  \"continuous\": true 或 false,\n");
+        sb.append("  \"reason\": \"简短判断理由\"\n");
+        sb.append("}\n");
+
+        return sb.toString();
+    }
+}

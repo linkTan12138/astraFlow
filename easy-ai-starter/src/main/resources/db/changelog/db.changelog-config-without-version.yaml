@@ -1,0 +1,82 @@
+databaseChangeLog:
+  - changeSet:
+      id: 0016-config-current-scope
+      author: easy-ai
+      dbms: mysql
+      comment: NULL 与空字符串共用全局作用域；约束每个作用域的有效 DRAFT/PUBLISHED 唯一，保留 DISABLED 历史
+      preConditions:
+        onFail: HALT
+        onFailMessage: 同一租户作用域和任务类型存在重复 DRAFT/PUBLISHED 配置（NULL 和空字符串视为同一作用域），请先明确保留记录后再迁移。
+        sqlCheck:
+          expectedResult: '0'
+          sql: >-
+            SELECT COUNT(*) FROM (
+              SELECT COALESCE(tenant_id, ''), task_type, status
+              FROM ai_task_config
+              WHERE deleted = 0 AND status IN ('DRAFT', 'PUBLISHED')
+              GROUP BY COALESCE(tenant_id, ''), task_type, status
+              HAVING COUNT(*) > 1
+            ) duplicate_configs
+      changes:
+        - sql:
+            sql: >-
+              ALTER TABLE ai_task_config
+              ADD COLUMN tenant_scope VARCHAR(64) GENERATED ALWAYS AS (COALESCE(tenant_id, '')) STORED,
+              ADD COLUMN active_status VARCHAR(20) GENERATED ALWAYS AS
+                (CASE WHEN deleted = 0 AND status IN ('DRAFT', 'PUBLISHED') THEN status ELSE NULL END) STORED,
+              ADD UNIQUE KEY uk_config_active_scope (tenant_scope, task_type, active_status),
+              ADD INDEX idx_config_lookup (tenant_id, task_type, status, deleted)
+      rollback:
+        - sql:
+            sql: >-
+              ALTER TABLE ai_task_config DROP INDEX uk_config_active_scope,
+              DROP INDEX idx_config_lookup, DROP COLUMN active_status, DROP COLUMN tenant_scope
+  - changeSet:
+      id: 0017-drop-config-tenant-version-key
+      author: easy-ai
+      preConditions:
+        onFail: MARK_RAN
+        indexExists:
+          tableName: ai_task_config
+          indexName: uk_tenant_task_version
+      changes:
+        - dropUniqueConstraint:
+            tableName: ai_task_config
+            constraintName: uk_tenant_task_version
+  - changeSet:
+      id: 0018-drop-config-task-version-key
+      author: easy-ai
+      preConditions:
+        onFail: MARK_RAN
+        indexExists:
+          tableName: ai_task_config
+          indexName: uk_task_type_version
+      changes:
+        - dropUniqueConstraint:
+            tableName: ai_task_config
+            constraintName: uk_task_type_version
+  - changeSet:
+      id: 0019-drop-config-version
+      author: easy-ai
+      preConditions:
+        onFail: MARK_RAN
+        columnExists:
+          tableName: ai_task_config
+          columnName: version
+      changes:
+        - dropColumn:
+            tableName: ai_task_config
+            columnName: version
+  - changeSet:
+      id: 0020-drop-task-config-version
+      author: easy-ai
+      comment: 仅移除配置版本绑定列，保留任务并发控制所用的 version 列；历史 state JSON 的 configVersion 由应用忽略
+      preConditions:
+        onFail: MARK_RAN
+        columnExists:
+          tableName: ai_chat_session_task
+          columnName: config_version
+      changes:
+        - dropColumn:
+            tableName: ai_chat_session_task
+            columnName: config_version
